@@ -1,0 +1,90 @@
+
+run_etl_pipeline <- function(samples_dir, sample_map_dir, output_dir){
+  suppressPackageStartupMessages({
+    library(tidyverse)
+    library(vcfR)
+    library(arrow)
+  })
+  
+  options(stringsAsFactors = FALSE, scipen = 999)
+  
+  # Load mapping if provided (assuming columns: SampleID, SampleName)
+  tryCatch({
+    if (file.exists(sample_map_dir)) {
+      sample_map <- readxl::read_excel(sample_map_dir)
+      
+      sample_map <- sample_map %>%
+        mutate(GROUP = sapply(str_split(NAME, "-"), `[`, 1))
+      }
+    }, error = function(e){
+      stop("Sample map file not found.")
+    }) 
+  
+  
+  all_variants <- list()
+  all_annotations <- list()
+  
+  # Discover VCF files only; files are processed individually.
+  samples <- list.dirs(samples_dir)[-1]
+  
+  for (i in seq_along(samples)) {
+    
+    folder <- samples[i]
+    
+    sample_id <- basename(folder)
+    message(sprintf("[%d/%d] Processing %s", i, length(samples), sample_id))
+    
+    vcf_file <- list.files(folder, pattern = "\\.(vcf|vcf\\.gz)?$", full.names = TRUE)
+    if (!length(vcf_file)) {
+      warning("No .vcf or .vcf.gz files found in: ", sample_id, call. = FALSE)
+    }
+    
+    anno_file <- list.files(folder, pattern = "\\.csv$", full.names = TRUE)
+    if (!length(anno_file)) {
+      warning("No annotation file found in: ", sample_id, call. = FALSE)
+    }
+    
+    tryCatch({
+      # 1A. Load VCF
+      vcf <- read.vcfR(vcf_file, verbose = FALSE)
+      
+      # 1B. Load custom annotation
+      anno_data <- read_csv(anno_file, col_types = cols(.default = col_character()))
+      
+    }, error = function(e){
+      warning("No file available for:", sample_id, call. = F)
+    })
+    
+    # 2. Extract fixed variant info (CHR, POS, REF, ALT)
+    vcf_fix <- as.data.frame(vcf@fix) %>%
+      mutate(VariantID = paste(CHROM, POS, REF, ALT, sep = "_"))
+    
+    # Extracting genotype information
+    gt_data <- extract_gt_tidy(vcf, gt_column_prepend = "", 
+                               VariantKey = vcf_fix$VariantID, verbose = F)
+    
+    variant_info <- vcf_fix %>%
+      left_join(gt_data, by = c("VariantID" = "VariantKey"))
+    
+    all_variants[[sample_id]] <- variant_info
+    
+    # 3. Building VariantID in annotation data
+    anno_data <- anno_data %>% 
+      mutate(VariantID = paste(chrom, start, REF, ALT, sep = "_")) %>%
+      mutate(Sample_ID = sample_id)
+    
+    all_annotations[[sample_id]] <- anno_data
+  }
+  
+  # 4. Combine and deduplicate Variants table
+  final_variants <- bind_rows(all_variants) %>% distinct(VariantID, .keep_all = TRUE)
+  final_annotations <- bind_rows(all_annotations)
+  
+  
+  # 5. Persistent backup creation
+  write_dataset(final_variants, path = file.path(output_dir, "variants"), format = "parquet")
+  write_dataset(final_annotations, path = file.path(output_dir, "annotations"), format = "parquet")
+  write_dataset(sample_map, path = file.path(output_dir, "metadata"), format = "parquet")
+  
+  return(TRUE)
+}

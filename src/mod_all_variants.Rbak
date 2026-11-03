@@ -1,0 +1,160 @@
+allVariantsUI <- function(id) {
+  ns <- NS(id)
+  
+  # Using bslib's layout_sidebar to hold the controls and table views
+  layout_sidebar(
+    sidebar = sidebar(
+      title = "Filters & Tools",
+      width = 300,
+      
+      # 2. Summarise button
+      actionButton(ns("view_summary"), "Summarise", class = "btn-outline-info mb-2"),
+      
+      # 4. Patient breakup button
+      actionButton(ns("view_breakup"), "Patient Breakup", class = "btn-outline-primary"),
+
+      p(strong("Views")),
+      actionButton(ns("view_default"), "Default Table", class = "btn-outline-primary mb-2"),
+      
+      # 3. Search gene field
+      textInput(ns("search_gene"), "Search Gene:", placeholder = "e.g., MT-ND1"),
+      hr(),
+      
+      # 1. Download button
+      downloadButton(ns("download_csv"), "Download Current View", class = "btn-success"),
+      hr()
+    ),
+    
+    # Main panel routing based on selected view
+    uiOutput(ns("main_content"))
+  )
+}
+
+allVariantsServer <- function(id, db_path, con) {
+  moduleServer(id, function(input, output, session) {
+    
+    # State manager for the active table view
+    current_view <- reactiveVal("default")
+    
+    observeEvent(input$view_default, current_view("default"))
+    observeEvent(input$view_summary, current_view("summary"))
+    observeEvent(input$view_breakup, current_view("breakup"))
+    
+    # Register views in DuckDB for the 3 expected Parquet files
+    observeEvent(db_path(), {
+      req(db_path())
+      
+      # Assuming the updated ETL will write to distinct subdirectories to prevent schema collisions
+      var_path  <- file.path(db_path(), "variants", "*.parquet")
+      anno_path <- file.path(db_path(), "annotations", "*.parquet")
+      map_path  <- file.path(db_path(), "metadata", "*.parquet")
+      
+      
+      try({
+        dbExecute(con, paste0("CREATE OR REPLACE VIEW variants AS SELECT * FROM read_parquet('", var_path, "')"))
+        dbExecute(con, paste0("CREATE OR REPLACE VIEW annotations AS SELECT * FROM read_parquet('", anno_path, "')"))
+        dbExecute(con, paste0("CREATE OR REPLACE VIEW sample_map AS SELECT * FROM read_parquet('", map_path, "')"))
+      }, silent = TRUE)
+    })
+    
+    # Reactive base query handling the joins and the Gene search filter
+    base_data <- reactive({
+      req(db_path())
+      
+      # Join the 3 tables (update join keys to match your exact ETL schema later)
+      query <- tbl(con, "variants") %>%
+        left_join(tbl(con, "annotations"), by = c("VariantID")) %>%
+        left_join(tbl(con, "sample_map"), by = c("Sample_ID" = "GRG"))
+      
+      # Apply gene search filter if text exists
+      if (isTruthy(input$search_gene)) {
+        search_term <- paste0("%", toupper(input$search_gene), "%")
+        # Assuming the column is named 'gene' or 'Gene' in the annotations table
+        query <- query %>% filter(upper(gene) %like% !!search_term)
+      }
+      
+      query
+    })
+    
+    # UI Router
+    output$main_content <- renderUI({
+      view <- current_view()
+      if (view == "default") {
+        tagList(h3("All Variants View"), DTOutput(session$ns("table_default")))
+      } else if (view == "summary") {
+        tagList(h3("Summary Table"), DTOutput(session$ns("table_summary")))
+      } else if (view == "breakup") {
+        tagList(h3("Patient Breakup"), DTOutput(session$ns("table_breakup")))
+      }
+    })
+    
+    # Render: Default Table
+    output$table_default <- renderDT({
+      data_to_show <- base_data() %>% 
+        mutate(Variant = paste(CHROM, ".", POS, paste(REF, ">", ALT))) %>%
+        dplyr::select(Variant, VariantID, CHROM, POS, REF, ALT, 
+                        Gene.ensGene, Func.ensGene) %>%
+        collect() %>% unique()
+      datatable(data_to_show, options = list(pageLength = 20, scrollX = TRUE))
+    })
+    
+    # Render: Summary Table (Placeholder)
+    output$table_summary <- renderDT({
+      # Code to be written later
+      summary_table <- base_data() %>% 
+        mutate(Variant = paste(CHROM, ".", POS, paste(REF, ">", ALT))) %>%
+        dplyr::select(VariantID, Variant, CHROM, POS, REF, ALT, 
+                      Gene.ensGene, Func.ensGene, NAME, GROUP) %>%
+        dplyr::group_by(VariantID, Variant, CHROM, POS, REF, ALT,
+                        Gene.ensGene, Func.ensGene, GROUP) %>%
+        dplyr::summarise(`No of patients` = n()) %>%
+        collect()
+      datatable(summary_table, options = list(pageLength = 20, scrollX = TRUE))
+    })
+    
+    # Render: Patient Breakup Table (GraphPad Prism Style)
+    output$table_breakup <- renderDT({
+      # 1. Pivot the data wider (variants as rows, patient metrics as columns)
+      raw_data <- base_data() %>% head(1000) %>% collect()
+      
+      # Placeholder pivot logic. You will need tidyr::pivot_wider here
+      # wide_data <- raw_data %>% pivot_wider(names_from = Sample_ID, values_from = c(GT, DP, GQ))
+      
+      # 2. Custom HTML container for merged top-level column headers
+      # This is how you achieve the GraphPad Prism grouped column look in DT
+      sketch <- htmltools::withTags(table(
+        class = 'display',
+        thead(
+          tr(
+            th(rowspan = 2, 'VariantID'),
+            th(rowspan = 2, 'Gene'),
+            th(colspan = 3, 'Patient_1', class = 'dt-center'), # Merge 3 columns for Patient 1
+            th(colspan = 3, 'Patient_2', class = 'dt-center')  # Merge 3 columns for Patient 2
+          ),
+          tr(
+            lapply(rep(c('GT', 'DP', 'GQ'), 2), th) # Sub-columns
+          )
+        )
+      ))
+      
+      datatable(
+        raw_data, # Replace with wide_data once pivoted
+        container = sketch,
+        rownames = FALSE,
+        options = list(pageLength = 20, scrollX = TRUE)
+      )
+    })
+    
+    # Download Handler (Downloads the full filtered dataset, bypassing the 1000 row UI limit)
+    output$download_csv <- downloadHandler(
+      filename = function() {
+        paste("MitoVar_Export_", Sys.Date(), ".csv", sep="")
+      },
+      content = function(file) {
+        export_data <- output$table_default
+        write.csv(export_data, file, row.names = FALSE)
+      }
+    )
+    
+  })
+}

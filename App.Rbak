@@ -1,0 +1,84 @@
+library(shiny)
+library(shinydashboard)
+library(bslib)
+library(duckdb)
+library(dplyr)
+library(DBI)
+library(DT)
+
+# Enable bookmarking for saving filter states
+enableBookmarking("server")
+
+ui <- function(request) {
+  page_navbar(
+    title = "MitoVarxploreR",
+    theme = bs_theme(version = 5, bootswatch = "flatly"),
+    
+    # Page 1: Variant Filtering & Summary
+    nav_panel("Variant Dashboard",
+              sidebarLayout(
+                sidebarPanel(
+                  h4("Global Filters"),
+                  textInput("gene_filter", "Search Gene:", value = ""),
+                  selectInput("gt_filter", "Genotype (GT):", choices = c("All", "0/1", "1/1"), selected = "All"),
+                  bookmarkButton(label = "Save Session State"), # Saves filter configuration
+                  hr(),
+                  downloadButton("export_csv", "Export Current View")
+                ),
+                mainPanel(
+                  valueBoxOutput("variant_count", width = 10),
+                  DTOutput("variant_table")
+                )
+              )
+    ),
+    
+    # Page 2: Patient View
+    nav_panel("Patient Explorer",
+              # Add sample-specific UI here
+              p("Individual sample exploration goes here.")
+    )
+  )
+}
+
+server <- function(input, output, session) {
+  
+  # Connect to DuckDB and map the Parquet files (Runs once per session)
+  con <- dbConnect(duckdb::duckdb(), dbdir = ":memory:")
+  
+  # Create views in DuckDB pointing directly to the Parquet directory
+  dbExecute(con, "CREATE VIEW variants AS SELECT * FROM read_parquet('../Temp_data/variants/*.parquet')")
+  # dbExecute(con, "CREATE VIEW genotypes AS SELECT * FROM read_parquet('path/to/parquet_database/genotypes/*/*.parquet')")
+  
+  # Reactive database query built with dplyr (lazy evaluation)
+  filtered_data <- reactive({
+    # tbl() connects to the DuckDB view
+    query <- tbl(con, "variants")
+    # query <- tbl(con, "variants") %>%
+    #   inner_join(tbl(con, "genotypes"), by = "VariantID")
+    
+    # Apply filters dynamically
+    if (input$gene_filter != "") {
+      query <- query %>% filter(Gene %LIKE% paste0("%", !!input$gene_filter, "%"))
+    }
+    
+    if (input$gt_filter != "All") {
+      query <- query %>% filter(GT == !!input$gt_filter)
+    }
+    
+    query
+  })
+  
+  # Render the Data Table (collects only the required rows for the UI)
+  output$variant_table <- renderDT({
+    # collect() triggers the DuckDB execution and brings data into R memory
+    data_to_show <- filtered_data() %>% head(1000) %>% collect() 
+    datatable(data_to_show, options = list(pageLength = 15, scrollX = TRUE))
+  })
+  
+  # Cleanup DuckDB connection when session ends
+  session$onSessionEnded(function() {
+    dbDisconnect(con, shutdown = TRUE)
+  })
+}
+
+shinyApp(ui, server)
